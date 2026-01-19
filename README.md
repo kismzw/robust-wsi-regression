@@ -62,3 +62,41 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
+```
+## Quick Start
+
+The following commands run the full pipeline end-to-end using a small example setup.
+
+```bash
+# install dependencies
+pip install -r requirements.txt
+
+# generate group-aware train/validation splits
+python make_splits.py \
+  --metadata_csv data/metadata.csv \
+  --out_csv splits/split_seed42.csv \
+  --seed 42
+
+# run an end-to-end dry run (sanity check)
+python train.py --config configs/base.yaml --dry_run
+```
+This executes:
+
+data loading → model forward → training → evaluation
+
+and saves artifacts under `results/run_*/`.
+
+## Reproducibility
+
+Reproducibility is treated as a first-class design goal in this repository.
+
+Key measures include:
+
+- Deterministic seeding across Python, NumPy, and PyTorch
+- Group-aware train/validation splits persisted to disk
+- Train-only target normalization to prevent data leakage
+- Config-driven experiments via YAML
+- Metrics, checkpoints, and resolved configs saved for every run
+
+Given the same config file and split CSV, results are expected to be reproducible
+up to hardware-level nondeterminism.
