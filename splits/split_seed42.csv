@@ -1,0 +1,9 @@
+path,group_id,split
+img/1.png,G1,val
+img/2.png,G1,val
+img/3.png,G1,val
+img/4.png,G2,train
+img/5.png,G2,train
+img/6.png,G2,train
+img/7.png,G3,train
+img/8.png,G3,train
