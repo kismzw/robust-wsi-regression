@@ -1,0 +1,26 @@
+seed: 42
+
+data:
+  csv: data/metadata.csv
+  split: splits/split_seed42.csv
+  image_size: 224
+  batch_size: 4        # dry_run用に小さめ
+  num_workers: 0       # ローカル検証は0が安全
+  target_dim: 50
+  normalize_target: true
+
+model:
+  backbone: resnet18
+  pretrained: false    # ローカル確認では false 推奨
+  output_dim: 50
+
+train:
+  epochs: 1            # dry_runなので1でOK
+  lr: 0.0003
+  weight_decay: 0.0001
+  amp: false           # CPU環境なので false
+
+eval:
+  primary_metric: spearman
+  secondary_metrics: [pearson]
+  include_samplewise: false
