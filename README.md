@@ -1,1 +1,64 @@
-# robust-wsi-regression
+# Robust Image-to-Expression Regression (K=50)
+
+This repository demonstrates a **reproducible and scalable ML pipeline** for
+**image → high-dimensional regression (K=50)**, inspired by transcriptomic prediction from pathology.
+The emphasis is **not** on chasing SOTA, but on building a pipeline that is:
+
+- **Reproducible** (deterministic seeds, fixed splits, saved configs)
+- **Data-integrity aware** (group-aware splits to prevent leakage)
+- **Evaluation-robust** (rank-based metrics for log-scale gene expression)
+- **Scale-ready** (clean separation of data/model/training; DDP-ready structure)
+
+## Why Spearman correlation?
+Gene expression targets are typically log-transformed (e.g., log1p / log2(TPM+1)) and often heavy-tailed.
+For such targets, **relative ordering** is often more meaningful than absolute scale.
+Therefore, we use **mean Spearman correlation** as the **primary evaluation metric**.
+
+- **Primary metric:** mean Spearman correlation (gene-wise average)
+- **Secondary metric:** mean Pearson correlation (for reference)
+- **Training loss:** MSE (optimize continuous targets; evaluate with rank consistency)
+
+---
+
+## Project structure
+
+- `train.py` — main training entrypoint (config-driven)
+- `make_splits.py` — creates and saves group-aware splits
+- `engine/`
+  - `seed.py` — deterministic seeding (Python/NumPy/PyTorch/worker)
+  - `data.py` — dataset, transforms, target normalization (train-only stats)
+  - `model.py` — backbone + regression head
+  - `trainer.py` — train/val loop (single-GPU in Week1; DDP-ready hooks)
+  - `metrics.py` — Spearman/Pearson implementations
+  - `io.py` — run directory + config/metrics serialization
+- `configs/` — YAML configs (data/model/train)
+- `splits/` — persisted split CSVs for exact reproducibility
+- `results/` — run artifacts (gitignored)
+
+---
+
+## Data format (public/abstracted)
+
+This repo expects a single CSV with paths, group identifiers, and K=50 targets.
+
+**Required columns:**
+- `path` (string): path to an image file
+- `group_id` (string/int): grouping key to prevent leakage (e.g., patient_id)
+- `y0 ... y49` (float): target vector (K=50), typically log-scale
+
+Example schema: see `data/metadata_schema.md` and `data/example_metadata.csv`.
+
+> Note: Real pathology WSIs and expression labels are often non-shareable.  
+> This repo is designed so the **same pipeline** applies to private WSI pipelines,
+> while using a public/abstracted dataset for demonstration.
+
+---
+
+## Setup
+
+### Option A: pip (simple)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
