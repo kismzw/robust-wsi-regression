@@ -215,6 +215,8 @@ def main() -> None:
 
     # Optimizer / AMP
     train_cfg = cfg.get("train", {})
+    grad_accum_steps = int(train_cfg.get("grad_accum_steps", 1))
+    assert grad_accum_steps >= 1, "grad_accum_steps must be >= 1"
     epochs = int(train_cfg.get("epochs", 10))
     lr = float(train_cfg.get("lr", 3e-4))
     wd = float(train_cfg.get("weight_decay", 1e-4))
@@ -237,6 +239,13 @@ def main() -> None:
     else:
         max_train_batches = args.max_train_batches if args.max_train_batches > 0 else None
         max_val_batches = args.max_val_batches if args.max_val_batches > 0 else None
+    
+    # Print effective batch size
+    if is_main:
+        micro = int(data_cfg.get("batch_size", 32))
+        eff = micro * grad_accum_steps * world_size
+        print(f"[BATCH] micro={micro} accum={grad_accum_steps} world={world_size} => effective_global={eff}")
+
 
     # Training loop
     log_lines = []
@@ -297,6 +306,7 @@ def main() -> None:
             device=device,
             scaler=scaler,
             max_batches=max_train_batches,
+            grad_accum_steps=grad_accum_steps,
         )
         va = evaluate(
             model=model,

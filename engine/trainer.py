@@ -47,6 +47,7 @@ def train_one_epoch(
     device: torch.device,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     max_batches: Optional[int] = None,
+    grad_accum_steps: int = 1,
 ) -> Dict[str, float]:
     """
     Train for one epoch and return aggregated stats.
@@ -56,12 +57,16 @@ def train_one_epoch(
         max_batches: if set, only run this many batches (dry_run)
     """
     model.train()
+    assert grad_accum_steps >= 1, "grad_accum_steps must be >= 1"
     loss_fn = nn.MSELoss()
 
     total_loss = 0.0
     n_batches = 0
 
     use_amp = scaler is not None
+
+    # zero grad before starting
+    optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(loader):
         if max_batches is not None and step >= max_batches:
@@ -70,24 +75,43 @@ def train_one_epoch(
         x = batch["x"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
             with torch.cuda.amp.autocast():
                 pred = model(x)
                 loss = loss_fn(pred, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # scale loss for accumulation
+            loss_to_bp = loss / grad_accum_steps
+            scaler.scale(loss_to_bp).backward()
         else:
             pred = model(x)
             loss = loss_fn(pred, y)
-            loss.backward()
-            optimizer.step()
+            loss_to_bp = loss / grad_accum_steps
+            loss_to_bp.backward()
 
         total_loss += float(loss.detach().cpu().item())
         n_batches += 1
 
+        # Step only every grad_accum_steps micro-batches
+        do_step = ((step + 1) % grad_accum_steps == 0)
+
+        if do_step:
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
+            optimizer.zero_grad(set_to_none=True)
+    # Handle leftover grads if number of batches not divisible by grad_accum_steps
+    if n_batches > 0 and (n_batches % grad_accum_steps != 0):
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        
     avg_loss = total_loss / max(n_batches, 1)
     return {
         "train_loss": avg_loss,

@@ -15,6 +15,7 @@ model:
   output_dim: 50
 
 train:
+  grad_accum_steps: 4
   epochs: 1            # dry_runなので1でOK
   lr: 0.0003
   weight_decay: 0.0001
