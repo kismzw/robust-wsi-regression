@@ -81,10 +81,80 @@ python make_splits.py \
 python train.py --config configs/base.yaml --dry_run
 ```
 This executes:
-
+```kotlin
 data loading → model forward → training → evaluation
-
+```
 and saves artifacts under `results/run_*/`.
+
+## Running training
+
+### Single GPU / CPU
+```bash
+python train.py --config configs/base.yaml
+```
+### Distributed Data Parallel (DDP)
+```bash
+torchrun --nproc_per_node=2 train.py --config configs/base.yaml
+```
+### Resume training
+
+Training can be safely resumed from any checkpoint while preserving:
+
+* model / optimizer / AMP state
+
+* current epoch
+
+* best validation metric
+
+```bash
+python train.py \
+  --config configs/base.yaml \
+  --resume results/<run_name>/checkpoints/last.pt
+```
+
+## Gradient accumulation
+
+To support large effective batch sizes under limited GPU memory,
+this pipeline implements **gradient accumulation**.
+
+Effective global batch size is defined as:
+
+```text
+effective_batch = micro_batch × grad_accum_steps × world_size
+```
+
+Example:
+- `batch_size = 4`
+- `grad_accum_steps = 4`
+- `world_size = 1`
+
+→ effective global batch = **16**
+
+Configure via YAML:
+```yaml
+train:
+  grad_accum_steps: 4
+```
+
+During training, the effective batch size is logged for transparency.
+
+## Outputs
+
+Each run creates a self-contained directory under `results/`:
+
+
+```text
+results/run_YYYYMMDD_HHMMSS/
+├── checkpoints/
+│ ├── last.pt # latest checkpoint (resume-safe)
+│ └── best.pt # best by primary metric
+├── config_resolved.yaml
+├── metrics.json
+└── log.txt
+```
+
+This design ensures experiments are **fully reproducible and auditable**.
+
 
 ## Reproducibility
 
