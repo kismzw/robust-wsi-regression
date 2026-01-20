@@ -244,15 +244,15 @@ def main() -> None:
         stats = {"epoch": epoch, **tr, **va}
 
         # Console logging (simple)
-        primary_key = f"val_{primary_metric}"
-        primary_val = stats.get(primary_key, float("nan"))
-        line = (
-            f"Epoch {epoch:03d} | "
-            f"train_loss={stats['train_loss']:.4f} | "
-            f"val_loss={stats['val_loss']:.4f} | "
-            f"{primary_key}={primary_val:.4f}"
-        )
         if is_main:
+            primary_key = f"val_{primary_metric}"
+            primary_val = stats.get(primary_key, float("nan"))
+            line = (
+                f"Epoch {epoch:03d} | "
+                f"train_loss={stats['train_loss']:.4f} | "
+                f"val_loss={stats.get('val_loss',float('nan')):.4f} | "
+                f"{primary_key}={primary_val:.4f}"
+            )
             print(line)
             log_lines.append(line)
 
