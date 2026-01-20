@@ -40,6 +40,7 @@ import pandas as pd
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 
 
@@ -229,6 +230,10 @@ def build_dataloaders(
     seed: int = 42,
     path_col: str = "path",
     split_col: str = "split",
+    # --- DDP knobs ---
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Dict[str, Any]:
     """
     High-level builder that returns dataloaders and fit artifacts (e.g., scaler stats).
@@ -259,27 +264,60 @@ def build_dataloaders(
         val_df, target_dim=target_dim, image_transform=val_tfm, target_scaler=scaler, path_col=path_col
     )
 
-    # Deterministic-ish DataLoader generator (controls shuffle order)
-    g = torch.Generator()
-    g.manual_seed(seed)
+    # Pin memory only helps when CUDA is available (avoids warning on CPU)
+    pin_memory = torch.cuda.is_available()
+
+    # Samplers (DDP)
+    train_sampler = None
+    val_sampler = None
+    shuffle_train = True
+
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
+        )
+        val_sampler = DistributedSampler(
+            val_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        shuffle_train = False  # sampler does shuffling
+
+    # Deterministic-ish DataLoader generator (single-process shuffle order)
+    # In DDP, shuffling is controlled by DistributedSampler + set_epoch(epoch),
+    # so we only use generator for the non-distributed case.
+    generator = None
+    if not distributed:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        generator = g
 
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle_train,
+        sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=False,
         worker_init_fn=_worker_init_fn,
-        generator=g,
+        generator=generator,
     )
 
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=False,
         worker_init_fn=_worker_init_fn,
     )
@@ -290,11 +328,15 @@ def build_dataloaders(
         "n_val": len(val_ds),
         "target_dim": target_dim,
         "image_size": image_size,
+        "distributed": distributed,
+        "world_size": world_size,
     }
 
     return {
         "train_loader": train_loader,
         "val_loader": val_loader,
+        "train_sampler": train_sampler,  # ★追加：train.pyでset_epochに使う
+        "val_sampler": val_sampler,
         "artifacts": artifacts,
-        "df_merged": df,  # useful for debugging; you can omit later
+        "df_merged": df,  # debugging; optional
     }

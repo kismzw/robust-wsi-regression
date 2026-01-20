@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import torch
+import torch.distributed as dist
 import yaml
 
 from engine.data import build_dataloaders
@@ -37,6 +38,18 @@ from engine.trainer import build_amp_scaler, build_optimizer, evaluate, train_on
 # -------------------------
 # Minimal IO helpers (self-contained)
 # -------------------------
+
+def is_distributed() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+def get_dist_info():
+    if not is_distributed():
+        return 0, 0, 1  # local_rank, rank, world_size
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    return local_rank, rank, world_size
+
 
 def _now_run_name() -> str:
     return "run_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -105,23 +118,40 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
 
+    local_rank, rank, world_size = get_dist_info()
+    is_main = (rank == 0)
+
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
 
-    device = get_device()
+    if is_distributed():
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
 
     # Resolve run directory
     run_dir = Path(args.run_dir) if args.run_dir else Path("results") / _now_run_name()
-    _ensure_dir(run_dir)
+    if is_main:
+        _ensure_dir(run_dir)
 
+    if is_distributed():
+        dist.barrier()  # wait for main process to create dir
     # Save resolved config early
     cfg_resolved = dict(cfg)
     cfg_resolved["runtime"] = {
         "device": str(device),
         "dry_run": bool(args.dry_run),
         "seed": seed,
+        "distributed": bool(is_distributed()),
+        "rank" : rank,
+        "world_size": world_size,
     }
-    _save_yaml(run_dir / "config_resolved.yaml", cfg_resolved)
+
+    if is_main:
+        _save_yaml(run_dir / "config_resolved.yaml", cfg_resolved)
 
     # Build dataloaders
     data_cfg = cfg.get("data", {})
@@ -134,9 +164,13 @@ def main() -> None:
         target_dim=int(data_cfg.get("target_dim", 50)),
         normalize_target=bool(data_cfg.get("normalize_target", True)),
         seed=seed,
+        distributed=is_distributed(),
+        rank=rank,
+        world_size=world_size,
     )
     train_loader = dls["train_loader"]
     val_loader = dls["val_loader"]
+    train_sampler = dls.get("train_sampler", None)
     artifacts = dls["artifacts"]
 
     # Build model
@@ -147,6 +181,12 @@ def main() -> None:
 
     model = build_model(backbone=backbone, pretrained=pretrained, output_dim=output_dim)
     model.to(device)
+
+    if is_distributed():
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+        )
 
     # Optimizer / AMP
     train_cfg = cfg.get("train", {})
@@ -180,6 +220,8 @@ def main() -> None:
     last_ckpt_path = run_dir / "ckpt_last.pt"
 
     for epoch in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         tr = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -210,47 +252,49 @@ def main() -> None:
             f"val_loss={stats['val_loss']:.4f} | "
             f"{primary_key}={primary_val:.4f}"
         )
-        print(line)
-        log_lines.append(line)
+        if is_main:
+            print(line)
+            log_lines.append(line)
 
-        # Save last checkpoint each epoch (small repo; ok)
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-                "config": cfg_resolved,
-                "artifacts": artifacts,
-                "stats": stats,
-            },
-            last_ckpt_path,
-        )
+            # Save last checkpoint each epoch (small repo; ok)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+                    "config": cfg_resolved,
+                    "artifacts": artifacts,
+                    "stats": stats,
+                },
+                last_ckpt_path,
+            )
 
-        # Save best checkpoint by primary metric
-        if isinstance(primary_val, (int, float)) and primary_val == primary_val:  # not NaN
-            if primary_val > best_primary:
-                best_primary = float(primary_val)
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-                        "config": cfg_resolved,
-                        "artifacts": artifacts,
-                        "stats": stats,
-                    },
-                    best_ckpt_path,
-                )
+            # Save best checkpoint by primary metric
+            if isinstance(primary_val, (int, float)) and primary_val == primary_val:  # not NaN
+                if primary_val > best_primary:
+                    best_primary = float(primary_val)
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+                            "config": cfg_resolved,
+                            "artifacts": artifacts,
+                            "stats": stats,
+                        },
+                        best_ckpt_path,
+                    )
 
-        # Save metrics snapshot
-        _save_json(run_dir / "metrics.json", {"best_primary": best_primary, "last": stats})
+            # Save metrics snapshot
+            _save_json(run_dir / "metrics.json", {"best_primary": best_primary, "last": stats})
 
     # Write log file
-    _save_text(run_dir / "log.txt", "\n".join(log_lines) + "\n")
+    if is_main:
+        _save_text(run_dir / "log.txt", "\n".join(log_lines) + "\n")
 
-    print(f"[OK] Run saved to: {run_dir}")
+        print(f"[OK] Run saved to: {run_dir}")
 
 
 if __name__ == "__main__":
