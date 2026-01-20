@@ -38,6 +38,12 @@ from engine.trainer import build_amp_scaler, build_optimizer, evaluate, train_on
 # -------------------------
 # Minimal IO helpers (self-contained)
 # -------------------------
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+def ddp_barrier():
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 def is_distributed() -> bool:
     return int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -137,8 +143,8 @@ def main() -> None:
     if is_main:
         _ensure_dir(run_dir)
 
-    if is_distributed():
-        dist.barrier()  # wait for main process to create dir
+    ddp_barrier() # wait for main process to create dir
+    
     # Save resolved config early
     cfg_resolved = dict(cfg)
     cfg_resolved["runtime"] = {
@@ -216,9 +222,13 @@ def main() -> None:
     # Training loop
     log_lines = []
     best_primary = float("-inf")
-    best_ckpt_path = run_dir / "ckpt_best.pt"
-    last_ckpt_path = run_dir / "ckpt_last.pt"
+    ckpt_dir = run_dir / "checkpoints"
+    if is_main:
+        _ensure_dir(ckpt_dir)
+    ddp_barrier()  # ensure ckpt_dir exists
 
+    best_ckpt_path = ckpt_dir / "best.pt"
+    last_ckpt_path = ckpt_dir / "last.pt"
     for epoch in range(1, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -256,11 +266,13 @@ def main() -> None:
             print(line)
             log_lines.append(line)
 
+            m = unwrap_model(model)
+
             # Save last checkpoint each epoch (small repo; ok)
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": m.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
                     "config": cfg_resolved,
@@ -277,7 +289,7 @@ def main() -> None:
                     torch.save(
                         {
                             "epoch": epoch,
-                            "model_state_dict": model.state_dict(),
+                            "model_state_dict": m.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
                             "config": cfg_resolved,
@@ -289,7 +301,8 @@ def main() -> None:
 
             # Save metrics snapshot
             _save_json(run_dir / "metrics.json", {"best_primary": best_primary, "last": stats})
-
+        # Keep ranks in sync
+        ddp_barrier()
     # Write log file
     if is_main:
         _save_text(run_dir / "log.txt", "\n".join(log_lines) + "\n")
