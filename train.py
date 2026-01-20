@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from dataclasses import dataclass
@@ -33,7 +34,7 @@ from engine.data import build_dataloaders
 from engine.model import build_model
 from engine.seed import set_seed
 from engine.trainer import build_amp_scaler, build_optimizer, evaluate, train_one_epoch
-
+from typing import Optional
 
 # -------------------------
 # Minimal IO helpers (self-contained)
@@ -44,6 +45,22 @@ def unwrap_model(model):
 def ddp_barrier():
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+def load_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    device: Optional[torch.device] = None,
+    strict: bool = True,
+) -> dict:
+    ckpt = torch.load(str(path), map_location="cpu")
+    m = unwrap_model(model)
+    m.load_state_dict(ckpt["model_state_dict"], strict=strict)
+    if optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scaler is not None and ckpt.get("scaler_state_dict") is not None:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+    return ckpt
 
 def is_distributed() -> bool:
     return int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -109,6 +126,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry_run", action="store_true", help="Run only a couple of batches for sanity check.")
     p.add_argument("--max_train_batches", type=int, default=0, help="Override max train batches (0 = no limit).")
     p.add_argument("--max_val_batches", type=int, default=0, help="Override max val batches (0 = no limit).")
+    p.add_argument("--resume",type=str, default="", help="Optional checkpoint path to resume from.")
+    p.add_argument("--resume_strict", action="store_true", help="Use strict=True when loading model weights.")
     return p.parse_args()
 
 
@@ -222,6 +241,7 @@ def main() -> None:
     # Training loop
     log_lines = []
     best_primary = float("-inf")
+    start_epoch = 1
     ckpt_dir = run_dir / "checkpoints"
     if is_main:
         _ensure_dir(ckpt_dir)
@@ -229,7 +249,45 @@ def main() -> None:
 
     best_ckpt_path = ckpt_dir / "best.pt"
     last_ckpt_path = ckpt_dir / "last.pt"
+
+    # Resume from checkpoint if specified
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        
+        # All ranks load. Rank 0 prints.
+        ckpt = load_checkpoint(
+            path=resume_path,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            strict=args.resume_strict,
+        )
+        # epoch is the last completed epoch
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        # Restore best_primary if available
+        primary_key = f"val_{primary_metric}"
+        ckpt_stats = ckpt.get("stats", {}) if isinstance(ckpt.get("stats", {}), dict) else {}
+        if primary_key in ckpt_stats:
+            try:
+                best_primary = float(ckpt_stats[primary_key])
+            except Exception:
+                best_primary = float("-inf")
+        # If you store best_primary explicitly, this will override:
+        if ckpt.get("best_primary") is not None:
+            try:
+                best_primary = float(ckpt["best_primary"])
+            except Exception:
+                pass
+
+        ddp_barrier()
+        if is_main:
+            print(f"[RESUME] Loaded checkpoint from {resume_path} (start_epoch {start_epoch}, best_primary {best_primary:.6f})")
     for epoch in range(1, epochs + 1):
+        if epoch < start_epoch:
+            continue
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         tr = train_one_epoch(
@@ -268,6 +326,15 @@ def main() -> None:
 
             m = unwrap_model(model)
 
+            try:
+                primary_val_f = float(primary_val)
+            except Exception:
+                primary_val_f = None
+
+            improved = (primary_val_f is not None) and (primary_val_f == primary_val_f) and (primary_val_f > best_primary)
+            if improved:
+                best_primary = primary_val_f
+
             # Save last checkpoint each epoch (small repo; ok)
             torch.save(
                 {
@@ -278,15 +345,14 @@ def main() -> None:
                     "config": cfg_resolved,
                     "artifacts": artifacts,
                     "stats": stats,
+                    "best_primary": best_primary,
                 },
                 last_ckpt_path,
             )
 
             # Save best checkpoint by primary metric
-            if isinstance(primary_val, (int, float)) and primary_val == primary_val:  # not NaN
-                if primary_val > best_primary:
-                    best_primary = float(primary_val)
-                    torch.save(
+            if improved:
+                torch.save(
                         {
                             "epoch": epoch,
                             "model_state_dict": m.state_dict(),
@@ -295,6 +361,7 @@ def main() -> None:
                             "config": cfg_resolved,
                             "artifacts": artifacts,
                             "stats": stats,
+                            "best_primary": best_primary,
                         },
                         best_ckpt_path,
                     )
