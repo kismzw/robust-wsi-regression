@@ -112,6 +112,23 @@ torchrun --nproc_per_node=2 train.py --config configs/base.yaml \
   --resume results/<run_name>/checkpoints/last.pt
 ```
 
+## Run naming rule
+By default a descriptive run name is auto-generated and used as `results/<run_name>/`:
+```
+<backbone>__bs<batch>x<accum>x<world>__lr<lr>__seed<seed>__<timestamp>
+```
+Example: `resnet18__bs4x4x1__lr0.0003__seed42__20260122_170000`  
+Override with `logging.run_name` in `configs/base.yaml` if you need a custom name.
+
+## Aggregating results
+Aggregate all run `metrics.json` files into a Markdown table.
+```bash
+python scripts/aggregate_results.py \
+  --results_dir results \
+  --out_md results/summary.md
+```
+The table is also printed to stdout; omit `--out_md` if you just want the console output.
+
 ## Gradient accumulation
 
 To support large effective batch sizes under limited GPU memory,

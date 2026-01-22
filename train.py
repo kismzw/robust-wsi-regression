@@ -105,6 +105,27 @@ def _save_text(path: Path, text: str) -> None:
         f.write(text)
 
 
+def _make_run_name(cfg: Dict[str, Any], world_size: int) -> str:
+    """
+    Build a descriptive run name from config + world size.
+    Example: resnet18__bs4x4x1__lr3e-04__seed42__20260122_170000
+    """
+    model_name = str(cfg.get("model", {}).get("backbone", "model"))
+    train_cfg = cfg.get("train", {})
+    data_cfg = cfg.get("data", {})
+    bs = data_cfg.get("batch_size", "bs")
+    accum = train_cfg.get("grad_accum_steps", "acc")
+    lr = train_cfg.get("lr", "lr")
+    seed = cfg.get("seed", "seed")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def _clean(x: str) -> str:
+        return "".join([c if c.isalnum() or c in "-._" else "_" for c in x])
+
+    name = f"{model_name}__bs{bs}x{accum}x{world_size}__lr{lr}__seed{seed}__{ts}"
+    return _clean(name)
+
+
 def _try_import_wandb():
     try:
         import wandb  # type: ignore
@@ -212,8 +233,9 @@ def main() -> None:
 
 
     # Resolve run directory
-    run_dir = Path(args.run_dir) if args.run_dir else Path("results") / _now_run_name()
-    run_name = logging_cfg.get("run_name") or run_dir.name
+    auto_run_name = _make_run_name(cfg, world_size=world_size)
+    run_name = logging_cfg.get("run_name") or auto_run_name
+    run_dir = Path(args.run_dir) if args.run_dir else Path("results") / run_name
     if is_main:
         _ensure_dir(run_dir)
 
