@@ -62,6 +62,7 @@ def train_one_epoch(
 
     total_loss = 0.0
     n_batches = 0
+    n_samples = 0
 
     use_amp = scaler is not None
 
@@ -89,8 +90,10 @@ def train_one_epoch(
             loss_to_bp = loss / grad_accum_steps
             loss_to_bp.backward()
 
-        total_loss += float(loss.detach().cpu().item())
+        bs = int(y.shape[0])
+        total_loss += float(loss.detach().cpu().item()) * bs
         n_batches += 1
+        n_samples += bs
 
         # Step only every grad_accum_steps micro-batches
         do_step = ((step + 1) % grad_accum_steps == 0)
@@ -112,10 +115,11 @@ def train_one_epoch(
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         
-    avg_loss = total_loss / max(n_batches, 1)
+    avg_loss = total_loss / max(n_samples, 1)
     return {
         "train_loss": avg_loss,
         "train_batches": float(n_batches),
+        "train_samples": float(n_samples),
     }
 
 
@@ -155,6 +159,7 @@ def evaluate(
 
     total_loss = 0.0
     n_batches = 0
+    n_samples = 0
 
     y_true_all = []
     y_pred_all = []
@@ -170,23 +175,31 @@ def evaluate(
             pred = model(x)
             loss = loss_fn(pred, y)
 
-        total_loss += float(loss.detach().cpu().item())
+        bs = int(y.shape[0])
+        total_loss += float(loss.detach().cpu().item()) * bs
         n_batches += 1
+        n_samples += bs
 
         y_true_all.append(_to_numpy(y))
         y_pred_all.append(_to_numpy(pred))
 
     # --- aggregate loss across ranks ---
     if _dist_is_on():
-        loss_tensor = torch.tensor([total_loss, float(n_batches)], device=device, dtype=torch.float64)
+        loss_tensor = torch.tensor(
+            [total_loss, float(n_samples), float(n_batches)],
+            device=device,
+            dtype=torch.float64,
+        )
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         total_loss_global = float(loss_tensor[0].item())
-        n_batches_global = float(loss_tensor[1].item())
+        n_samples_global = float(loss_tensor[1].item())
+        n_batches_global = float(loss_tensor[2].item())
     else:
         total_loss_global = total_loss
+        n_samples_global = float(n_samples)
         n_batches_global = float(n_batches)
 
-    avg_loss = total_loss_global / max(n_batches_global, 1.0)
+    avg_loss = total_loss_global / max(n_samples_global, 1.0)
 
     # --- gather predictions across ranks for global metrics ---
     y_true_np = np.concatenate(y_true_all, axis=0) if y_true_all else np.zeros((0, 0), dtype=np.float64)
@@ -194,6 +207,11 @@ def evaluate(
 
     y_true_np = _gather_numpy(y_true_np)
     y_pred_np = _gather_numpy(y_pred_np)
+
+    # DistributedSampler(drop_last=False) pads with duplicates; trim to real dataset size.
+    n_total = len(loader.dataset)
+    y_true_np = y_true_np[:n_total]
+    y_pred_np = y_pred_np[:n_total]
 
     # compute metrics on rank0 only in DDP
     if _dist_is_on() and dist.get_rank() != 0:
@@ -207,7 +225,11 @@ def evaluate(
         include_samplewise=include_samplewise,
     )
 
-    out: Dict[str, float] = {"val_loss": float(avg_loss), "val_batches": float(n_batches_global)}
+    out: Dict[str, float] = {
+        "val_loss": float(avg_loss),
+        "val_batches": float(n_batches_global),
+        "val_samples": float(n_samples_global),
+    }
     for k, v in metrics.items():
         # be robust if some metric returns arrays (optional)
         if isinstance(v, (np.ndarray, list)):

@@ -17,7 +17,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 from dataclasses import dataclass
@@ -53,11 +52,17 @@ def load_checkpoint(
     device: Optional[torch.device] = None,
     strict: bool = True,
 ) -> dict:
-    ckpt = torch.load(str(path), map_location="cpu")
+    map_location = device if device is not None else "cpu"
+    ckpt = torch.load(str(path), map_location=map_location)
     m = unwrap_model(model)
     m.load_state_dict(ckpt["model_state_dict"], strict=strict)
     if optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if device is not None:
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(device, non_blocking=True)
     if scaler is not None and ckpt.get("scaler_state_dict") is not None:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
     return ckpt
@@ -132,7 +137,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prefer CUDA -> MPS -> CPU
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 # -------------------------
@@ -153,8 +163,14 @@ def main() -> None:
         dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
+        if get_device().type == "mps":
+            raise RuntimeError("Distributed training is not supported on MPS. Run single process on Apple Silicon.")
 
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    base_device = get_device()
+    if base_device.type == "cuda":
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = base_device
 
 
     # Resolve run directory
