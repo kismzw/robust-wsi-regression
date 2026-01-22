@@ -48,6 +48,7 @@ def load_checkpoint(
     path: Path,
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     device: Optional[torch.device] = None,
     strict: bool = True,
@@ -63,6 +64,8 @@ def load_checkpoint(
                 for k, v in state.items():
                     if torch.is_tensor(v):
                         state[k] = v.to(device, non_blocking=True)
+    if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     if scaler is not None and ckpt.get("scaler_state_dict") is not None:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
     return ckpt
@@ -143,6 +146,29 @@ def get_device() -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def build_scheduler(
+    name: str,
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    step_size: int = 1,
+    gamma: float = 0.5,
+) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+    """
+    Minimal LR scheduler builder. Supports:
+      - none: no scheduler
+      - step: StepLR(step_size, gamma)
+      - cosine: CosineAnnealingLR(T_max=epochs)
+    """
+    name_l = (name or "none").lower()
+    if name_l in ("none", "", "null"):
+        return None
+    if name_l == "step":
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    if name_l == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    raise ValueError(f"Unknown scheduler: {name}")
 
 
 # -------------------------
@@ -239,6 +265,17 @@ def main() -> None:
     amp = bool(train_cfg.get("amp", True))
 
     optimizer = build_optimizer(model, lr=lr, weight_decay=wd)
+    scheduler_cfg = train_cfg.get("scheduler", {})
+    scheduler_name = scheduler_cfg.get("name", "none") if isinstance(scheduler_cfg, dict) else str(scheduler_cfg)
+    scheduler_step_size = int(scheduler_cfg.get("step_size", 1)) if isinstance(scheduler_cfg, dict) else 1
+    scheduler_gamma = float(scheduler_cfg.get("gamma", 0.5)) if isinstance(scheduler_cfg, dict) else 0.5
+    scheduler = build_scheduler(
+        name=scheduler_name,
+        optimizer=optimizer,
+        epochs=epochs,
+        step_size=scheduler_step_size,
+        gamma=scheduler_gamma,
+    )
     scaler = build_amp_scaler(enabled=amp)
 
     # Metrics config
@@ -286,6 +323,7 @@ def main() -> None:
             path=resume_path,
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             scaler=scaler,
             device=device,
             strict=args.resume_strict,
@@ -335,7 +373,12 @@ def main() -> None:
         )
 
         # Merge stats
-        stats = {"epoch": epoch, **tr, **va}
+        current_lr = float(optimizer.param_groups[0]["lr"])
+        stats = {"epoch": epoch, "lr": current_lr, **tr, **va}
+
+        # Step scheduler (all ranks) after epoch stats are computed
+        if scheduler is not None:
+            scheduler.step()
 
         # Console logging (simple)
         if is_main:
@@ -367,6 +410,7 @@ def main() -> None:
                     "epoch": epoch,
                     "model_state_dict": m.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                     "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
                     "config": cfg_resolved,
                     "artifacts": artifacts,
@@ -383,6 +427,7 @@ def main() -> None:
                             "epoch": epoch,
                             "model_state_dict": m.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                             "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
                             "config": cfg_resolved,
                             "artifacts": artifacts,

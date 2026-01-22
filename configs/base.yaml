@@ -20,6 +20,10 @@ train:
   lr: 0.0003
   weight_decay: 0.0001
   amp: false           # CPU環境なので false
+  scheduler:
+    name: step         # "none" to disable
+    step_size: 1
+    gamma: 0.5
 
 eval:
   primary_metric: spearman
