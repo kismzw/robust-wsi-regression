@@ -29,3 +29,10 @@ eval:
   primary_metric: spearman
   secondary_metrics: [pearson]
   include_samplewise: false
+
+logging:
+  use_wandb: true        # trueにするとW&Bへ送信
+  project: wsi-regression # W&Bのプロジェクト名
+  entity: ""              # 必要なら指定
+  mode: online            # online/offline/disabled
+  run_name: ""            # 空なら自動(run_YYYYMMDD_HHMMSS)

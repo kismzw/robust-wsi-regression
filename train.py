@@ -105,6 +105,15 @@ def _save_text(path: Path, text: str) -> None:
         f.write(text)
 
 
+def _try_import_wandb():
+    try:
+        import wandb  # type: ignore
+    except Exception as e:
+        print(f"[WARN] W&B is enabled but could not be imported: {e}")
+        return None
+    return wandb
+
+
 # -------------------------
 # Config
 # -------------------------
@@ -181,6 +190,9 @@ def main() -> None:
 
     local_rank, rank, world_size = get_dist_info()
     is_main = (rank == 0)
+    logging_cfg = cfg.get("logging", {})
+    use_wandb = bool(logging_cfg.get("use_wandb", False))
+    wandb_run = None
 
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
@@ -201,6 +213,7 @@ def main() -> None:
 
     # Resolve run directory
     run_dir = Path(args.run_dir) if args.run_dir else Path("results") / _now_run_name()
+    run_name = logging_cfg.get("run_name") or run_dir.name
     if is_main:
         _ensure_dir(run_dir)
 
@@ -219,6 +232,28 @@ def main() -> None:
 
     if is_main:
         _save_yaml(run_dir / "config_resolved.yaml", cfg_resolved)
+
+    # Optional W&B logging (main process only)
+    if use_wandb and is_main:
+        wandb = _try_import_wandb()
+        if wandb is not None:
+            wandb_mode = logging_cfg.get("mode", "online")
+            wandb_project = logging_cfg.get("project", "wsi-regression")
+            wandb_entity = logging_cfg.get("entity") or None
+            try:
+                wandb_run = wandb.init(
+                    project=wandb_project,
+                    entity=wandb_entity,
+                    mode=wandb_mode,
+                    name=run_name,
+                    config=cfg_resolved,
+                )
+            except Exception as e:
+                print(f"[WARN] W&B init failed; disabling W&B for this run: {e}")
+                wandb_run = None
+                use_wandb = False
+        else:
+            use_wandb = False
 
     # Build dataloaders
     data_cfg = cfg.get("data", {})
@@ -303,6 +338,7 @@ def main() -> None:
     # Training loop
     log_lines = []
     best_primary = float("-inf")
+    best_stats = None
     start_epoch = 1
     ckpt_dir = run_dir / "checkpoints"
     if is_main:
@@ -338,6 +374,7 @@ def main() -> None:
                 best_primary = float(ckpt_stats[primary_key])
             except Exception:
                 best_primary = float("-inf")
+            best_stats = dict(ckpt_stats)
         # If you store best_primary explicitly, this will override:
         if ckpt.get("best_primary") is not None:
             try:
@@ -403,6 +440,7 @@ def main() -> None:
             improved = (primary_val_f is not None) and (primary_val_f == primary_val_f) and (primary_val_f > best_primary)
             if improved:
                 best_primary = primary_val_f
+                best_stats = dict(stats)
 
             # Save last checkpoint each epoch (small repo; ok)
             torch.save(
@@ -438,7 +476,18 @@ def main() -> None:
                     )
 
             # Save metrics snapshot
-            _save_json(run_dir / "metrics.json", {"best_primary": best_primary, "last": stats})
+            _save_json(
+                run_dir / "metrics.json",
+                {
+                    "run_name": run_name,
+                    "best_primary": best_primary,
+                    "best": best_stats,
+                    "last": stats,
+                },
+            )
+            # W&B logging
+            if use_wandb and wandb_run is not None:
+                wandb_run.log(stats)
         # Keep ranks in sync
         ddp_barrier()
     # Write log file
@@ -446,6 +495,8 @@ def main() -> None:
         _save_text(run_dir / "log.txt", "\n".join(log_lines) + "\n")
 
         print(f"[OK] Run saved to: {run_dir}")
+        if use_wandb and wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
