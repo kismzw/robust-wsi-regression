@@ -92,23 +92,23 @@ and saves artifacts under `results/run_*/`.
 ```bash
 python train.py --config configs/base.yaml
 ```
+
 ### Distributed Data Parallel (DDP)
+- Requires CUDA; DDP on MPS is blocked. Use a Linux/GPU box for real DDP testing.
+- Two processes on one node:
 ```bash
 torchrun --nproc_per_node=2 train.py --config configs/base.yaml
 ```
-### Resume training
+- Quick sanity only: add `--dry_run`. Set `OMP_NUM_THREADS=1` if you want to silence torchrun’s advisory warning.
 
-Training can be safely resumed from any checkpoint while preserving:
-
-* model / optimizer / AMP state
-
-* current epoch
-
-* best validation metric
-
+### Resume training (single/DDP)
+Resumes model/optimizer/scheduler/AMP state, current epoch, and best metric.
 ```bash
-python train.py \
-  --config configs/base.yaml \
+# single process
+python train.py --config configs/base.yaml --resume results/<run_name>/checkpoints/last.pt
+
+# multi-process (same flags)
+torchrun --nproc_per_node=2 train.py --config configs/base.yaml \
   --resume results/<run_name>/checkpoints/last.pt
 ```
 
